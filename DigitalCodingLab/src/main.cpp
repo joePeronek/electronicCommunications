@@ -1,141 +1,116 @@
 #include <Arduino.h>
-#include <avr/interrupt.h>
 
-constexpr uint8_t PIN_NRZ_MASK = _BV(3);          // PORTE3, digital pin 5
-constexpr uint8_t PIN_NRZI_MASK = _BV(3);         // PORTH3, digital pin 6
-constexpr uint8_t PIN_MANCHESTER_MASK = _BV(4);   // PORTH4, digital pin 7
-constexpr uint8_t PORT_H_MASK = PIN_NRZI_MASK | PIN_MANCHESTER_MASK;
+constexpr uint8_t PIN_NRZ = 5;
+constexpr uint8_t PIN_MANCHESTER = 6;
+constexpr unsigned long BIT_PERIOD_US = 50;
+constexpr unsigned long HALF_BIT_PERIOD_US = BIT_PERIOD_US / 2;
+constexpr unsigned long INTERFRAME_DELAY_MS = 10;
 
-constexpr uint8_t BIT_SEQUENCE[] = {0, 1, 0, 1, 1, 0, 1};
-constexpr uint8_t BIT_COUNT = sizeof(BIT_SEQUENCE);
+constexpr uint8_t DATA_BITS[] = {1, 0, 0, 0, 0, 0, 0, 0,
+                                 1, 0, 0, 0, 0, 0, 0, 1};
+constexpr size_t DATA_LENGTH = sizeof(DATA_BITS) / sizeof(DATA_BITS[0]);
+constexpr uint8_t MAX_CONSECUTIVE_ZEROS = 6;
+constexpr bool PRINT_STUFFED_SEQUENCE = false;
+constexpr size_t MAX_STUFFED_BITS =
+    DATA_LENGTH + (DATA_LENGTH / MAX_CONSECUTIVE_ZEROS) + 1;
 
-constexpr unsigned long INTER_TX_DELAY_MS = 10;
-constexpr uint16_t TIMER1_COMPARE = 49;  // 25 µs with 16 MHz clock, prescaler 8
+uint8_t stuffedBits[MAX_STUFFED_BITS];
+size_t stuffedLength = 0;
 
-volatile bool isTransmitting = false;
-volatile bool halfPhase = false;
-volatile uint8_t currentBit = 0;
-volatile uint8_t nrziLevel = 0;
-volatile bool transmissionCompleted = false;
+void transmitManchester(uint8_t bit) {
+  const uint8_t firstHalf = bit ? HIGH : LOW;
+  const uint8_t secondHalf = bit ? LOW : HIGH;
 
-volatile uint8_t portEShadow = 0;
-volatile uint8_t portHShadow = 0;
-
-unsigned long nextStartMillis = 0;
-
-void startTransmission() {
-  noInterrupts();
-
-  currentBit = 0;
-  halfPhase = false;
-  nrziLevel = 0;
-  transmissionCompleted = false;
-
-  portEShadow &= ~PIN_NRZ_MASK;
-  portHShadow &= ~PORT_H_MASK;
-  PORTE = portEShadow;
-  PORTH = portHShadow;
-
-  TCNT1 = 0;
-  isTransmitting = true;
-  TIMSK1 |= _BV(OCIE1A);
-
-  interrupts();
+  digitalWrite(PIN_MANCHESTER, firstHalf);
+  delayMicroseconds(HALF_BIT_PERIOD_US);
+  digitalWrite(PIN_MANCHESTER, secondHalf);
+  delayMicroseconds(HALF_BIT_PERIOD_US);
 }
 
-ISR(TIMER1_COMPA_vect) {
-  if (!isTransmitting) {
+void transmitDataBit(uint8_t bit) {
+  digitalWrite(PIN_NRZ, bit ? HIGH : LOW);
+  transmitManchester(bit);
+}
+
+void transmitStuffedNRZBit() {
+  digitalWrite(PIN_NRZ, HIGH);
+  delayMicroseconds(BIT_PERIOD_US);
+}
+
+void encodeFrame() {
+  stuffedLength = 0;
+  uint8_t zeroCount = 0;
+
+  for (size_t i = 0; i < DATA_LENGTH; ++i) {
+    const uint8_t bit = DATA_BITS[i];
+    stuffedBits[stuffedLength++] = bit;
+
+    if (bit == 0) {
+      ++zeroCount;
+      if (zeroCount == MAX_CONSECUTIVE_ZEROS) {
+        stuffedBits[stuffedLength++] = 1;
+        zeroCount = 0;
+      }
+    } else {
+      zeroCount = 0;
+    }
+  }
+}
+
+void logStuffedSequence() {
+  if (!PRINT_STUFFED_SEQUENCE) {
     return;
   }
 
-  const uint8_t bit = BIT_SEQUENCE[currentBit];
-
-  if (!halfPhase) {
-    // First half-bit window.
-    portEShadow = (portEShadow & ~PIN_NRZ_MASK) | (bit ? PIN_NRZ_MASK : 0);
-    PORTE = portEShadow;
-
-    if (bit) {
-      nrziLevel ^= 1;
-    }
-
-    uint8_t newH = (portHShadow & ~PORT_H_MASK);
-    if (nrziLevel) {
-      newH |= PIN_NRZI_MASK;
-    }
-    if (bit) {
-      newH |= PIN_MANCHESTER_MASK;
-    }
-    portHShadow = newH;
-    PORTH = portHShadow;
-
-    halfPhase = true;
-  } else {
-    // Second half-bit window.
-    uint8_t newH = portHShadow & ~PIN_MANCHESTER_MASK;
-    if (!bit) {
-      newH |= PIN_MANCHESTER_MASK;
-    }
-    portHShadow = newH;
-    PORTH = portHShadow;
-
-    halfPhase = false;
-    ++currentBit;
-
-    if (currentBit >= BIT_COUNT) {
-      portEShadow &= ~PIN_NRZ_MASK;
-      portHShadow &= ~PORT_H_MASK;
-      PORTE = portEShadow;
-      PORTH = portHShadow;
-
-      isTransmitting = false;
-      transmissionCompleted = true;
-      TIMSK1 &= ~_BV(OCIE1A);
-    }
+  Serial.begin(115200);
+  while (!Serial) {
+    ;
   }
+
+  Serial.print(F("Stuffed bits ("));
+  Serial.print(stuffedLength);
+  Serial.println(F("):"));
+
+  for (size_t i = 0; i < stuffedLength; ++i) {
+    Serial.print(stuffedBits[i]);
+  }
+  Serial.println();
 }
 
-void setupTimer() {
-  noInterrupts();
+void sendFrame() {
+  uint8_t zeroCount = 0;
 
-  TCCR1A = 0;
-  TCCR1B = 0;
-  TCNT1 = 0;
-  OCR1A = TIMER1_COMPARE;
-  TCCR1B |= _BV(WGM12);  // CTC mode
-  TCCR1B |= _BV(CS11);   // prescaler 8
-  TIMSK1 = 0;
+  for (size_t i = 0; i < DATA_LENGTH; ++i) {
+    const uint8_t bit = DATA_BITS[i];
+    transmitDataBit(bit);
 
-  interrupts();
+    if (bit == 0) {
+      ++zeroCount;
+      if (zeroCount == MAX_CONSECUTIVE_ZEROS) {
+        transmitStuffedNRZBit();
+        zeroCount = 0;
+      }
+    } else {
+      zeroCount = 0;
+    }
+  }
+
+  digitalWrite(PIN_NRZ, LOW);
+  digitalWrite(PIN_MANCHESTER, LOW);
 }
 
 void setup() {
-  noInterrupts();
+  pinMode(PIN_NRZ, OUTPUT);
+  pinMode(PIN_MANCHESTER, OUTPUT);
 
-  DDRE |= PIN_NRZ_MASK;
-  DDRH |= PORT_H_MASK;
+  digitalWrite(PIN_NRZ, LOW);
+  digitalWrite(PIN_MANCHESTER, LOW);
 
-  portEShadow = PORTE & ~PIN_NRZ_MASK;
-  portHShadow = PORTH & ~PORT_H_MASK;
-  PORTE = portEShadow;
-  PORTH = portHShadow;
-
-  interrupts();
-
-  setupTimer();
+  encodeFrame();
+  logStuffedSequence(); // Optional serial trace for debugging bit stuffing.
 }
 
 void loop() {
-  if (transmissionCompleted) {
-    noInterrupts();
-    transmissionCompleted = false;
-    interrupts();
-
-    nextStartMillis = millis() + INTER_TX_DELAY_MS;
-  }
-
-  if (!isTransmitting && millis() >= nextStartMillis) {
-    startTransmission();
-  }
+  sendFrame();
+  delay(INTERFRAME_DELAY_MS);
 }
-
