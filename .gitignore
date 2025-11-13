@@ -1,0 +1,16 @@
+# --- macOS system files ---
+.DS_Store
+
+# --- PlatformIO build artifacts ---
+.piolibdeps/
+.pio/
+.pioenvs/
+.pio/build/
+.pio/libdeps/
+
+# --- clangd index (PlatformIO + C++ LSP) ---
+.cache/
+.cache/clangd/
+
+# --- Logs / misc ---
+*.log
